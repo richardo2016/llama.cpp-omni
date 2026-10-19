@@ -105,6 +105,18 @@ The core runtime pipeline of llama.cpp-omni consists of three stages:
 
 > **Note**: Apple Silicon uses unified memory architecture. Recommended: 16GB Mac for Q4_K_M/Q8_0, 32GB+ Mac for F16.
 
+### On-device MoE Inference (LES)
+
+MiniCPM-V 4.7 35B-A3B runs on mobile devices with expert weights streamed from SSD. LES keeps
+decode speed usable without dropping experts. Decode speed as each optimization is added:
+
+| Device | Baseline | + LES | + mixed-precision quantization | + DSpark |
+|--------|---------:|------:|-------------------------------:|---------:|
+| iPhone 18 Pro Max (12 GB) | 3.38 token/s | 11.34 token/s | 17.16 token/s | **20.51 token/s** |
+| iPad Pro 11-inch M4 (16 GB) | 2.97 token/s | 9.81 token/s | 14.92 token/s | **17.39 token/s** |
+
+See [LES: Lookahead Expert Scheduling](docs/les/lookahead-expert-scheduling.md) for details.
+
 ---
 
 ## Quick Start
