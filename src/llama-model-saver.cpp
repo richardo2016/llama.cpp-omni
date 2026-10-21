@@ -118,6 +118,7 @@ void llama_model_saver::add_kv(const enum llm_kv key, const Container & value, c
 }
 // instantiate for external usage:
 template void llama_model_saver::add_kv<std::vector<uint32_t>>(const enum llm_kv, const std::vector<uint32_t> &, const bool);
+template void llama_model_saver::add_kv<std::vector<int32_t>> (const enum llm_kv, const std::vector<int32_t> &,  const bool);
 
 void llama_model_saver::add_kv(const enum llm_kv key, const std::vector<std::string> & value) {
     std::vector<const char *> tmp(value.size());
@@ -218,6 +219,19 @@ void llama_model_saver::add_kv_from_model() {
     // add_kv(LLM_KV_TENSOR_DATA_LAYOUT,                ???);
     add_kv(LLM_KV_EXPERT_COUNT,                      hparams.n_expert);
     add_kv(LLM_KV_EXPERT_USED_COUNT,                 hparams.n_expert_used);
+    if (hparams.n_expert_used > 0) {
+        bool has_prun = false;
+        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+            if (hparams.moe_expert_prun[il] > 0) {
+                has_prun = true;
+                break;
+            }
+        }
+        if (has_prun) {
+            const std::vector<int32_t> prun(hparams.moe_expert_prun.begin(), hparams.moe_expert_prun.begin() + hparams.n_layer);
+            add_kv(LLM_KV_MOE_EXPERT_PRUN, prun, false);
+        }
+    }
     add_kv(LLM_KV_EXPERT_SHARED_COUNT,               hparams.n_expert_shared);
     add_kv(LLM_KV_EXPERT_GROUP_COUNT,                hparams.n_expert_groups);
     add_kv(LLM_KV_EXPERT_GROUP_USED_COUNT,           hparams.n_group_used);

@@ -1110,6 +1110,28 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         GGML_ASSERT(hparams.n_expert_groups == 0);
     }
 
+    // optional per-layer MoE routing budget for decode
+    std::fill(hparams.moe_expert_prun.begin(), hparams.moe_expert_prun.end(), 0);
+    if (ml.get_arr(LLM_KV_MOE_EXPERT_PRUN, hparams.moe_expert_prun, false)) {
+        uint32_t n_set = 0;
+        for (uint32_t il = 0; il < LLAMA_MAX_LAYERS; ++il) {
+            const int32_t n = hparams.moe_expert_prun[il];
+            if (n < 0 || (uint32_t) n > hparams.n_expert_used) {
+                throw std::runtime_error(format("%s: layer %u moe_expert_prun = %d, expected 0..%u",
+                        __func__, il, n, hparams.n_expert_used));
+            }
+            if (n > 0) {
+                if (il >= hparams.n_layer) {
+                    throw std::runtime_error(format("%s: moe_expert_prun has a value past n_layer = %u",
+                            __func__, hparams.n_layer));
+                }
+                n_set++;
+            }
+        }
+        LLAMA_LOG_INFO("%s: moe_expert_prun set for %u/%u layers (decode only)\n",
+                __func__, n_set, hparams.n_layer);
+    }
+
     std::fill(hparams.n_head_arr.begin(),    hparams.n_head_arr.end(),    0);
     std::fill(hparams.n_head_kv_arr.begin(), hparams.n_head_kv_arr.end(), 0);
     std::fill(hparams.n_ff_arr.begin(),      hparams.n_ff_arr.end(),      0);

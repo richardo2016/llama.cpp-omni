@@ -1435,6 +1435,27 @@ ggml_tensor * llm_graph_context::build_ffn(
     return cur;
 }
 
+int64_t llm_graph_context::moe_n_expert_used(int il, int64_t n_default) const {
+    // 32 is the Metal mul_mm_id threshold: at or above it the graph uses the map0
+    // kernel, which is precompiled per n_expert_used and cannot take arbitrary values.
+    // Below it mul_mv_id takes n_expert_used as a runtime argument.
+    static constexpr int64_t max_tokens = 32;
+
+    if (cparams.warmup || n_default <= 0 || ubatch.n_tokens >= max_tokens) {
+        return n_default;
+    }
+    if (il < 0 || (uint32_t) il >= hparams.n_layer) {
+        return n_default;
+    }
+
+    const int32_t n = hparams.moe_expert_prun[il];
+    if (n <= 0) {
+        return n_default;
+    }
+
+    return std::min<int64_t>(n, n_default);
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -1489,7 +1510,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * down_exps_b,
          ggml_tensor * exp_probs_b,
              int64_t   n_expert,
-             int64_t   n_expert_used,
+             int64_t   n_expert_used_in,
      llm_ffn_op_type   type_op,
                 bool   norm_w,
                float   w_scale,
@@ -1501,6 +1522,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s) const {
+    const int64_t n_expert_used = moe_n_expert_used(il, n_expert_used_in);
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -1875,26 +1897,28 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     assert(n_expert_used > 0);
 
+    // warmup may run with n_expert; aggregate only the default count to keep the
+    // number of add nodes small (ref: ggml-org/llama.cpp#14753)
+    const int64_t n_expert_agg = std::min<int64_t>(hparams.n_expert_used, n_expert_used);
+    GGML_ASSERT(n_expert_agg > 0);
+
     // order the views before the adds
-    for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
+    for (uint32_t i = 0; i < (uint32_t) n_expert_agg; ++i) {
         cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
 
         ggml_build_forward_expand(gf, cur_experts[i]);
     }
 
     // aggregate experts
-    // note: here we explicitly use hparams.n_expert_used instead of n_expert_used
-    //       to avoid potentially a large number of add nodes during warmup
-    //       ref: https://github.com/ggml-org/llama.cpp/pull/14753
     ggml_tensor * moe_out = cur_experts[0];
 
-    for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
+    for (uint32_t i = 1; i < (uint32_t) n_expert_agg; ++i) {
         moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
 
         ggml_build_forward_expand(gf, moe_out);
     }
 
-    if (hparams.n_expert_used == 1) {
+    if (n_expert_agg == 1) {
         // avoid returning a non-contiguous tensor
         moe_out = ggml_cont(ctx0, moe_out);
     }

@@ -116,6 +116,7 @@ class Keys:
         TENSOR_DATA_LAYOUT                = "{arch}.tensor_data_layout"
         EXPERT_COUNT                      = "{arch}.expert_count"
         EXPERT_USED_COUNT                 = "{arch}.expert_used_count"
+        MOE_EXPERT_PRUN                   = "{arch}.moe_expert_prun"
         EXPERT_SHARED_COUNT               = "{arch}.expert_shared_count"
         EXPERT_GROUP_COUNT                = "{arch}.expert_group_count"
         EXPERT_GROUP_USED_COUNT           = "{arch}.expert_group_used_count"

@@ -908,6 +908,9 @@ struct llm_graph_context {
        llm_ffn_gate_type   type_gate,
                      int   il) const;
 
+    // per-layer MoE top-k from model metadata, decode only
+    int64_t moe_n_expert_used(int il, int64_t n_default) const;
+
     // build MoE FFN without bias tensors
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
