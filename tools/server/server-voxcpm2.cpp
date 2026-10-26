@@ -95,9 +95,39 @@ static void res_ok(httplib::Response & res, const json & data) {
     res.set_content(data.dump(), "application/json");
 }
 
-static void res_error(httplib::Response & res, const json & err) {
-    res.status = json_value(err, "code", 500);
+static void res_error(httplib::Response & res, const json & err, int status = 400) {
+    res.status = status;
     res.set_content(err.dump(), "application/json");
+}
+
+// Optional bearer-token guard. The server binds loopback by default and is
+// supervised by RayAgents, so the key is opt-in via --api-key.
+static bool require_auth(const httplib::Request & req, httplib::Response & res, const common_params & params) {
+    if (params.api_keys.empty()) {
+        return true;
+    }
+    const std::string header = req.get_header_value("Authorization");
+    for (const auto & key : params.api_keys) {
+        if (header == "Bearer " + key) {
+            return true;
+        }
+    }
+    res_error(res, format_error_response("Unauthorized", "authentication_error"), 401);
+    return false;
+}
+
+static bool parse_json_body(const httplib::Request & req, httplib::Response & res, json & out) {
+    try {
+        out = json::parse(req.body);
+    } catch (const std::exception & err) {
+        res_error(res, format_error_response(std::string("Invalid JSON: ") + err.what()));
+        return false;
+    }
+    if (!out.is_object()) {
+        res_error(res, format_error_response("Request body must be a JSON object"));
+        return false;
+    }
+    return true;
 }
 
 // ─── WAV encode / decode ──────────────────────────────────────────────────
@@ -216,23 +246,43 @@ int main(int argc, char ** argv) {
 
     // ── Health ────────────────────────────────────────────────────────────
 
-    svr.Get("/health", [&](const httplib::Request &, httplib::Response & res) {
-        json health = {{"status", "ok"}, {"engine", "voxcpm2"}};
+    auto health_handler = [&](const httplib::Request & req, httplib::Response & res) {
+        if (!require_auth(req, res, params)) {
+            return;
+        }
+        VoxCPM2Runtime * rt = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            rt = state.runtime;
+        }
+        json health = {
+            {"status", "ok"},
+            {"ready", rt != nullptr && rt->initialized()},
+            {"engine", "voxcpm2"},
+            {"model", "voxcpm2"},
+            {"n_gpu_layers", params.voxcpm2_n_gpu_layers},
+        };
+        if (rt) {
+            health["sample_rate"] = rt->sample_rate();
+        }
         res.set_header("X-Engine", "voxcpm2");
         res_ok(res, health);
-    });
+    };
 
-    svr.Get("/v1/health", [&](const httplib::Request &, httplib::Response & res) {
-        json health = {{"status", "ok"}, {"engine", "voxcpm2"}};
-        res.set_header("X-Engine", "voxcpm2");
-        res_ok(res, health);
-    });
+    svr.Get("/health", health_handler);
+    svr.Get("/v1/health", health_handler);
 
     // ── POST /v1/voxcpm2/init ─────────────────────────────────────────────
 
     svr.Post("/v1/voxcpm2/init", [&](const httplib::Request & req, httplib::Response & res) {
         LOG_INF("handle_voxcpm2_init\n");
-        json data = json::parse(req.body);
+        if (!require_auth(req, res, params)) {
+            return;
+        }
+        json data;
+        if (!parse_json_body(req, res, data)) {
+            return;
+        }
 
         std::string base_lm = json_value(data, "base_lm", std::string(""));
         std::string acoustic = json_value(data, "acoustic", std::string(""));
@@ -256,7 +306,7 @@ int main(int argc, char ** argv) {
                 std::string err = rt->last_error();
                 rt->free();
                 delete rt;
-                res_error(res, format_error_response("VoxCPM2 init failed: " + err, "server_error"));
+                res_error(res, format_error_response("VoxCPM2 init failed: " + err, "server_error"), 500);
                 return;
             }
             rt->set_n_threads(params.cpuparams.n_threads);
@@ -267,7 +317,7 @@ int main(int argc, char ** argv) {
             {"success", true},
             {"base_lm", base_lm},
             {"acoustic", acoustic},
-            {"sample_rate", state.runtime->sample_rate()}
+            {"sample_rate", state.runtime ? state.runtime->sample_rate() : 0}
         };
         res_ok(res, ack);
     });
@@ -276,11 +326,21 @@ int main(int argc, char ** argv) {
 
     svr.Post("/v1/audio/speech", [&](const httplib::Request & req, httplib::Response & res) {
         LOG_INF("handle_audio_speech\n");
-        json data = json::parse(req.body);
+        if (!require_auth(req, res, params)) {
+            return;
+        }
+        json data;
+        if (!parse_json_body(req, res, data)) {
+            return;
+        }
 
         std::string input = json_value(data, "input", std::string(""));
         if (input.empty()) {
             res_error(res, format_error_response("\"input\" is required"));
+            return;
+        }
+        if (input.size() > 4000) {
+            res_error(res, format_error_response("\"input\" must be at most 4000 characters"));
             return;
         }
 
@@ -303,16 +363,6 @@ int main(int argc, char ** argv) {
         gen_params.max_steps           = json_value(data, "max_steps", 200);
         gen_params.temperature         = json_value(data, "temperature", 1.0f);
 
-        VoxCPM2Runtime * rt = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(state.mutex);
-            rt = state.runtime;
-        }
-        if (!rt || !rt->initialized()) {
-            res_error(res, format_error_response("VoxCPM2 not initialized. Call /v1/voxcpm2/init first or provide --voxcpm2-base-lm at startup."));
-            return;
-        }
-
         // Ultimate clone (continuation): reference_audio + prompt_text/ref_text
         // Plain clone: reference_audio only
         std::string prompt_text = json_value(data, "prompt_text", std::string(""));
@@ -320,37 +370,49 @@ int main(int argc, char ** argv) {
         if (prompt_text.empty()) prompt_text = json_value(data, "ref_text", std::string(""));
 
         std::vector<float> wav;
-        if (data.contains("reference_audio") && data.at("reference_audio").is_string()) {
-            std::string ref_b64 = data.at("reference_audio").get<std::string>();
-            if (!ref_b64.empty()) {
-                std::vector<uint8_t> ref_bytes = base64_decode(ref_b64);
-                int ref_sr = 0;
-                std::vector<float> ref_pcm = voxcpm2_load_wav_from_memory(ref_bytes, ref_sr);
-                if (ref_pcm.empty()) {
-                    res_error(res, format_error_response("Invalid reference_audio WAV data"));
-                    return;
-                }
-                gen_params.reference_sample_rate = ref_sr;
-                if (!prompt_text.empty()) {
-                    LOG_INF("clone+continuation (prompt_text len=%zu)\n", prompt_text.size());
-                    wav = rt->generate_with_continuation(input, prompt_text, ref_pcm, gen_params);
+        int sr = 0;
+        {
+            // The runtime is stateful and not thread-safe: serialize every
+            // synthesis (and init) through the same mutex.
+            std::lock_guard<std::mutex> lock(state.mutex);
+            VoxCPM2Runtime * rt = state.runtime;
+            if (!rt || !rt->initialized()) {
+                res_error(res, format_error_response("VoxCPM2 not initialized. Call /v1/voxcpm2/init first or provide --voxcpm2-base-lm at startup."), 503);
+                return;
+            }
+
+            if (data.contains("reference_audio") && data.at("reference_audio").is_string()) {
+                std::string ref_b64 = data.at("reference_audio").get<std::string>();
+                if (!ref_b64.empty()) {
+                    std::vector<uint8_t> ref_bytes = base64_decode(ref_b64);
+                    int ref_sr = 0;
+                    std::vector<float> ref_pcm = voxcpm2_load_wav_from_memory(ref_bytes, ref_sr);
+                    if (ref_pcm.empty()) {
+                        res_error(res, format_error_response("Invalid reference_audio WAV data"));
+                        return;
+                    }
+                    gen_params.reference_sample_rate = ref_sr;
+                    if (!prompt_text.empty()) {
+                        LOG_INF("clone+continuation (prompt_text len=%zu)\n", prompt_text.size());
+                        wav = rt->generate_with_continuation(input, prompt_text, ref_pcm, gen_params);
+                    } else {
+                        LOG_INF("clone (reference_audio only, no prompt_text)\n");
+                        wav = rt->generate_with_clone(input, ref_pcm, gen_params);
+                    }
                 } else {
-                    LOG_INF("clone (reference_audio only, no prompt_text)\n");
-                    wav = rt->generate_with_clone(input, ref_pcm, gen_params);
+                    wav = rt->generate(input, gen_params);
                 }
             } else {
                 wav = rt->generate(input, gen_params);
             }
-        } else {
-            wav = rt->generate(input, gen_params);
+
+            if (wav.empty()) {
+                res_error(res, format_error_response("VoxCPM2 generation failed: " + rt->last_error(), "server_error"), 500);
+                return;
+            }
+            sr = rt->sample_rate();
         }
 
-        if (wav.empty()) {
-            res_error(res, format_error_response("VoxCPM2 generation failed: " + rt->last_error(), "server_error"));
-            return;
-        }
-
-        int sr = rt->sample_rate();
         if (response_format == "wav") {
             std::string wav_data = voxcpm2_encode_wav(wav, sr);
             res.set_content(wav_data, "audio/wav");
@@ -365,11 +427,21 @@ int main(int argc, char ** argv) {
 
     svr.Post("/v1/audio/speech/stream", [&](const httplib::Request & req, httplib::Response & res) {
         LOG_INF("handle_audio_speech_stream\n");
-        json data = json::parse(req.body);
+        if (!require_auth(req, res, params)) {
+            return;
+        }
+        json data;
+        if (!parse_json_body(req, res, data)) {
+            return;
+        }
 
         std::string input = json_value(data, "input", std::string(""));
         if (input.empty()) {
             res_error(res, format_error_response("\"input\" is required"));
+            return;
+        }
+        if (input.size() > 4000) {
+            res_error(res, format_error_response("\"input\" must be at most 4000 characters"));
             return;
         }
 
@@ -386,21 +458,18 @@ int main(int argc, char ** argv) {
         gen_params.max_steps           = json_value(data, "max_steps", 200);
         gen_params.temperature         = json_value(data, "temperature", 1.0f);
 
-        VoxCPM2Runtime * rt = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(state.mutex);
-            rt = state.runtime;
-        }
-        if (!rt || !rt->initialized()) {
-            res_error(res, format_error_response("VoxCPM2 not initialized. Call /v1/voxcpm2/init first or provide --voxcpm2-base-lm at startup."));
-            return;
-        }
-
-        int sr = rt->sample_rate();
-
         res.set_chunked_content_provider(
             "audio/wav",
-            [rt, input, gen_params, sr, data](size_t /*offset*/, httplib::DataSink & sink) -> bool {
+            [&state, input, gen_params, data](size_t /*offset*/, httplib::DataSink & sink) -> bool {
+                // Serialize against other syntheses and /v1/voxcpm2/init: the
+                // runtime keeps decode state and is not thread-safe.
+                std::lock_guard<std::mutex> lock(state.mutex);
+                VoxCPM2Runtime * rt = state.runtime;
+                if (!rt || !rt->initialized()) {
+                    return false;
+                }
+                const int sr = rt->sample_rate();
+
                 // Write WAV header first (with unknown data size)
                 {
                     std::string header;
@@ -437,7 +506,6 @@ int main(int argc, char ** argv) {
                 // Full text in → true streaming audio out (incl. clone / continuation).
                 // Clone uses the same prefill as generate_with_* then patch-wise
                 // decode_streaming_from_ready_state for early TTFA (was: full decode + 100ms fake chunks).
-                VoxCPM2Runtime * mutable_rt = const_cast<VoxCPM2Runtime *>(rt);
                 if (has_clone) {
                     std::string ref_b64 = data.at("reference_audio").get<std::string>();
                     std::vector<uint8_t> ref_bytes = base64_decode(ref_b64);
@@ -449,14 +517,14 @@ int main(int argc, char ** argv) {
                     auto p = gen_params;
                     p.reference_sample_rate = ref_sr;
                     const bool ok = prompt_text.empty()
-                        ? mutable_rt->generate_with_clone_streaming(input, ref_pcm, chunk_callback, p)
-                        : mutable_rt->generate_with_continuation_streaming(
+                        ? rt->generate_with_clone_streaming(input, ref_pcm, chunk_callback, p)
+                        : rt->generate_with_continuation_streaming(
                               input, prompt_text, ref_pcm, chunk_callback, p);
                     if (!ok) {
                         return false;
                     }
                 } else {
-                    if (!mutable_rt->generate_streaming(input, chunk_callback, gen_params)) {
+                    if (!rt->generate_streaming(input, chunk_callback, gen_params)) {
                         return false;
                     }
                 }
@@ -469,7 +537,10 @@ int main(int argc, char ** argv) {
 
     // ── GET /v1/audio/speech/models ───────────────────────────────────────
 
-    svr.Get("/v1/audio/speech/models", [&](const httplib::Request &, httplib::Response & res) {
+    svr.Get("/v1/audio/speech/models", [&](const httplib::Request & req, httplib::Response & res) {
+        if (!require_auth(req, res, params)) {
+            return;
+        }
         json models = json::array();
         VoxCPM2Runtime * rt = nullptr;
         {
