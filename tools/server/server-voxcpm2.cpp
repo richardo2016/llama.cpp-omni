@@ -589,7 +589,12 @@ int main(int argc, char ** argv) {
 
     {
         auto * rt = new VoxCPM2Runtime();
-        if (!rt->init(params.voxcpm2_base_lm, params.voxcpm2_acoustic, params.voxcpm2_n_gpu_layers, /*use_gpu_backend=*/true)) {
+        // `--voxcpm2-n-gpu-layers 0` is the explicit CPU mode exposed by the
+        // RayAgents runtime.  The custom acoustic components have their own
+        // ggml backend, so forwarding zero only to BaseLM still selected Metal
+        // here and made the UI's CPU choice ineffective.
+        const bool use_gpu_backend = params.voxcpm2_n_gpu_layers != 0;
+        if (!rt->init(params.voxcpm2_base_lm, params.voxcpm2_acoustic, params.voxcpm2_n_gpu_layers, use_gpu_backend)) {
             LOG_ERR("VoxCPM2 init failed: %s\n", rt->last_error().c_str());
             rt->free();
             delete rt;
