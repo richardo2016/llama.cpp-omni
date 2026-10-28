@@ -11,6 +11,7 @@
 #include <thread>
 #include <fstream>
 #include <string>
+#include <cerrno>
 #include <cstring>
 #include <atomic>
 #include <signal.h>
@@ -594,6 +595,23 @@ int main(int argc, char ** argv) {
         params.n_threads_http = std::max(2, (int) std::thread::hardware_concurrency() - 1);
     }
     svr.new_task_queue = [&params] { return new httplib::ThreadPool(params.n_threads_http); };
+    svr.set_socket_options([reuse_port = params.reuse_port](const socket_t sock) {
+        httplib::set_socket_opt(sock, SOL_SOCKET, SO_REUSEADDR, 1);
+        if (reuse_port) {
+#ifdef SO_REUSEPORT
+            httplib::set_socket_opt(sock, SOL_SOCKET, SO_REUSEPORT, 1);
+#else
+            LOG_WRN("%s", "SO_REUSEPORT is not supported\n");
+#endif
+        }
+    });
+    svr.set_error_logger([](const httplib::Error & error, const httplib::Request * request) {
+        if (request != nullptr) {
+            return;
+        }
+        const auto system_error = errno;
+        LOG_ERR("HTTP server setup failed: %s (errno %d: %s)\n", httplib::to_string(error).c_str(), system_error, std::strerror(system_error));
+    });
 
     bool was_bound = false;
     if (params.hostname.find(".sock") != std::string::npos) {
