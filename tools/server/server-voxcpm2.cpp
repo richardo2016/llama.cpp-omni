@@ -8,6 +8,7 @@
 #include "arg.h"
 
 #include <mutex>
+#include <memory>
 #include <thread>
 #include <fstream>
 #include <string>
@@ -236,11 +237,22 @@ int main(int argc, char ** argv) {
 
     LOG_INF("VoxCPM2 TTS HTTP server starting...\n");
 
-    // HTTP server setup
+    // HTTP server setup.  TLS support is a build capability, not a mandate to
+    // construct an SSL server: the managed LocalAgent contract uses loopback
+    // HTTP unless the caller supplied both certificate files.
+    std::unique_ptr<httplib::Server> svr;
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-    httplib::SSLServer svr(params.ssl_file_cert.c_str(), params.ssl_file_key.c_str());
+    if (params.ssl_file_key != "" && params.ssl_file_cert != "") {
+        svr.reset(new httplib::SSLServer(params.ssl_file_cert.c_str(), params.ssl_file_key.c_str()));
+    } else {
+        svr.reset(new httplib::Server());
+    }
 #else
-    httplib::Server svr;
+    if (params.ssl_file_key != "" && params.ssl_file_cert != "") {
+        LOG_ERR("Server is built without SSL support\n");
+        return 1;
+    }
+    svr.reset(new httplib::Server());
 #endif
 
     voxcpm2_server_state state;
@@ -270,12 +282,12 @@ int main(int argc, char ** argv) {
         res_ok(res, health);
     };
 
-    svr.Get("/health", health_handler);
-    svr.Get("/v1/health", health_handler);
+    svr->Get("/health", health_handler);
+    svr->Get("/v1/health", health_handler);
 
     // ── POST /v1/voxcpm2/init ─────────────────────────────────────────────
 
-    svr.Post("/v1/voxcpm2/init", [&](const httplib::Request & req, httplib::Response & res) {
+    svr->Post("/v1/voxcpm2/init", [&](const httplib::Request & req, httplib::Response & res) {
         LOG_INF("handle_voxcpm2_init\n");
         if (!require_auth(req, res, params)) {
             return;
@@ -325,7 +337,7 @@ int main(int argc, char ** argv) {
 
     // ── POST /v1/audio/speech (OpenAI-compatible) ─────────────────────────
 
-    svr.Post("/v1/audio/speech", [&](const httplib::Request & req, httplib::Response & res) {
+    svr->Post("/v1/audio/speech", [&](const httplib::Request & req, httplib::Response & res) {
         LOG_INF("handle_audio_speech\n");
         if (!require_auth(req, res, params)) {
             return;
@@ -426,7 +438,7 @@ int main(int argc, char ** argv) {
 
     // ── POST /v1/audio/speech/stream ──────────────────────────────────────
 
-    svr.Post("/v1/audio/speech/stream", [&](const httplib::Request & req, httplib::Response & res) {
+    svr->Post("/v1/audio/speech/stream", [&](const httplib::Request & req, httplib::Response & res) {
         LOG_INF("handle_audio_speech_stream\n");
         if (!require_auth(req, res, params)) {
             return;
@@ -538,7 +550,7 @@ int main(int argc, char ** argv) {
 
     // ── GET /v1/audio/speech/models ───────────────────────────────────────
 
-    svr.Get("/v1/audio/speech/models", [&](const httplib::Request & req, httplib::Response & res) {
+    svr->Get("/v1/audio/speech/models", [&](const httplib::Request & req, httplib::Response & res) {
         if (!require_auth(req, res, params)) {
             return;
         }
@@ -594,8 +606,8 @@ int main(int argc, char ** argv) {
     if (params.n_threads_http < 1) {
         params.n_threads_http = std::max(2, (int) std::thread::hardware_concurrency() - 1);
     }
-    svr.new_task_queue = [&params] { return new httplib::ThreadPool(params.n_threads_http); };
-    svr.set_socket_options([reuse_port = params.reuse_port](const socket_t sock) {
+    svr->new_task_queue = [&params] { return new httplib::ThreadPool(params.n_threads_http); };
+    svr->set_socket_options([reuse_port = params.reuse_port](const socket_t sock) {
         httplib::set_socket_opt(sock, SOL_SOCKET, SO_REUSEADDR, 1);
         if (reuse_port) {
 #ifdef SO_REUSEPORT
@@ -605,7 +617,7 @@ int main(int argc, char ** argv) {
 #endif
         }
     });
-    svr.set_error_logger([](const httplib::Error & error, const httplib::Request * request) {
+    svr->set_error_logger([](const httplib::Error & error, const httplib::Request * request) {
         if (request != nullptr) {
             return;
         }
@@ -615,16 +627,16 @@ int main(int argc, char ** argv) {
 
     bool was_bound = false;
     if (params.hostname.find(".sock") != std::string::npos) {
-        svr.set_address_family(AF_UNIX);
-        was_bound = svr.bind_to_port(params.hostname, 8080);
+        svr->set_address_family(AF_UNIX);
+        was_bound = svr->bind_to_port(params.hostname, 8080);
     } else {
         if (params.port == 0) {
-            int bound_port = svr.bind_to_any_port(params.hostname);
+            int bound_port = svr->bind_to_any_port(params.hostname);
             if ((was_bound = (bound_port >= 0))) {
                 params.port = bound_port;
             }
         } else {
-            was_bound = svr.bind_to_port(params.hostname, params.port);
+            was_bound = svr->bind_to_port(params.hostname, params.port);
         }
     }
 
@@ -638,8 +650,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    std::thread http_thread([&]() { svr.listen_after_bind(); });
-    svr.wait_until_ready();
+    std::thread http_thread([&]() { svr->listen_after_bind(); });
+    svr->wait_until_ready();
 
     LOG_INF("VoxCPM2 TTS server is listening on http://%s:%d\n", params.hostname.c_str(), params.port);
 
@@ -648,7 +660,7 @@ int main(int argc, char ** argv) {
     std::atomic<bool> running{true};
     shutdown_handler = [&](int) {
         running.store(false);
-        svr.stop();
+        svr->stop();
     };
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
